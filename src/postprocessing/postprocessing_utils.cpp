@@ -12,6 +12,10 @@
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): convert_to_rgb_loop's and scale_colors_loop's rows on the parallel runner;
+   2026-10-24: both by the caller's code where it gives some (set_pixel_loops).
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #include "../../internal/libraw_cxx_defs.h"
 
 #define TBLN 65535
@@ -78,27 +82,41 @@ void LibRaw::exp_bef(float shift, float smooth)
 
 void LibRaw::convert_to_rgb_loop(float out_cam[3][4])
 {
+  /* PalaceRef: the caller's loop where it gives one and takes these pixels. */
+  if (pixel_loops.convert_to_rgb && pixel_loops.convert_to_rgb(pixel_loops_opaque, out_cam))
+    return;
+  /* PalaceRef: bands of rows on the parallel runner, each worker counting
+     into a histogram of its own, added up after. */
+  memset(libraw_internal_data.output_data.histogram, 0,
+         sizeof(int) * LIBRAW_HISTOGRAM_SIZE * 4);
+  const int workers = parallel_workers, band = 32, bands = (S.height + band - 1) / band;
+  int(*histograms)[4][LIBRAW_HISTOGRAM_SIZE] =
+      (int(*)[4][LIBRAW_HISTOGRAM_SIZE])calloc(workers, sizeof(int) * LIBRAW_HISTOGRAM_SIZE * 4);
+  if (!histograms)
+    throw LIBRAW_EXCEPTION_ALLOC;
+  auto rows = [&](int index, int worker)
+  {
   int row, col, c;
   float out[3];
   ushort *img;
-  memset(libraw_internal_data.output_data.histogram, 0,
-         sizeof(int) * LIBRAW_HISTOGRAM_SIZE * 4);
+  int(*histogram)[LIBRAW_HISTOGRAM_SIZE] = histograms[worker];
+  const int first = index * band, last = MIN(int(S.height), first + band);
   if (libraw_internal_data.internal_output_params.raw_color)
   {
-    for (img = imgdata.image[0], row = 0; row < S.height; row++)
+    for (img = imgdata.image[0] + size_t(first) * S.width * 4, row = first; row < last; row++)
     {
       for (col = 0; col < S.width; col++, img += 4)
       {
         for (c = 0; c < imgdata.idata.colors; c++)
         {
-          libraw_internal_data.output_data.histogram[c][img[c] >> 3]++;
+          histogram[c][img[c] >> 3]++;
         }
       }
     }
   }
   else if (imgdata.idata.colors == 3)
   {
-    for (img = imgdata.image[0], row = 0; row < S.height; row++)
+    for (img = imgdata.image[0] + size_t(first) * S.width * 4, row = first; row < last; row++)
     {
       for (col = 0; col < S.width; col++, img += 4)
       {
@@ -111,15 +129,15 @@ void LibRaw::convert_to_rgb_loop(float out_cam[3][4])
         img[0] = CLIP((int)out[0]);
         img[1] = CLIP((int)out[1]);
         img[2] = CLIP((int)out[2]);
-        libraw_internal_data.output_data.histogram[0][img[0] >> 3]++;
-        libraw_internal_data.output_data.histogram[1][img[1] >> 3]++;
-        libraw_internal_data.output_data.histogram[2][img[2] >> 3]++;
+        histogram[0][img[0] >> 3]++;
+        histogram[1][img[1] >> 3]++;
+        histogram[2][img[2] >> 3]++;
       }
     }
   }
   else if (imgdata.idata.colors == 4)
   {
-    for (img = imgdata.image[0], row = 0; row < S.height; row++)
+    for (img = imgdata.image[0] + size_t(first) * S.width * 4, row = first; row < last; row++)
     {
       for (col = 0; col < S.width; col++, img += 4)
       {
@@ -132,23 +150,46 @@ void LibRaw::convert_to_rgb_loop(float out_cam[3][4])
         img[0] = CLIP((int)out[0]);
         img[1] = CLIP((int)out[1]);
         img[2] = CLIP((int)out[2]);
-        libraw_internal_data.output_data.histogram[0][img[0] >> 3]++;
-        libraw_internal_data.output_data.histogram[1][img[1] >> 3]++;
-        libraw_internal_data.output_data.histogram[2][img[2] >> 3]++;
-        libraw_internal_data.output_data.histogram[3][img[3] >> 3]++;
+        histogram[0][img[0] >> 3]++;
+        histogram[1][img[1] >> 3]++;
+        histogram[2][img[2] >> 3]++;
+        histogram[3][img[3] >> 3]++;
       }
     }
   }
+  };
+  try
+  {
+    parallel_for(bands, rows);
+  }
+  catch (...)
+  {
+    free(histograms);
+    throw;
+  }
+  for (int w = 0; w < workers; w++)
+    for (int c = 0; c < 4; c++)
+      for (int i = 0; i < LIBRAW_HISTOGRAM_SIZE; i++)
+        libraw_internal_data.output_data.histogram[c][i] += histograms[w][c][i];
+  free(histograms);
 }
 
 void LibRaw::scale_colors_loop(float scale_mul[4])
 {
-  unsigned size = S.iheight * S.iwidth;
+  /* PalaceRef: the caller's loop where it gives one and takes these pixels. */
+  if (pixel_loops.scale_colors && pixel_loops.scale_colors(pixel_loops_opaque, scale_mul))
+    return;
+  /* PalaceRef: bands of rows on the parallel runner. */
+  const unsigned band = 32u * S.iwidth, size_all = S.iheight * S.iwidth;
+  const int bands = int((size_all + band - 1) / band);
+  auto pixels = [&](int index, int)
+  {
+  const unsigned first = unsigned(index) * band, size = MIN(size_all, first + band);
 
   if (C.cblack[4] && C.cblack[5])
   {
     int val;
-    for (unsigned i = 0; i < size; i++)
+    for (unsigned i = first; i < size; i++)
     {
       for (unsigned c = 0; c < 4; c++)
       {
@@ -163,7 +204,7 @@ void LibRaw::scale_colors_loop(float scale_mul[4])
   }
   else if (C.cblack[0] || C.cblack[1] || C.cblack[2] || C.cblack[3])
   {
-    for (unsigned i = 0; i < size; i++)
+    for (unsigned i = first; i < size; i++)
     {
       for (unsigned c = 0; c < 4; c++)
       {
@@ -177,7 +218,7 @@ void LibRaw::scale_colors_loop(float scale_mul[4])
   }
   else // BL is zero
   {
-    for (unsigned i = 0; i < size; i++)
+    for (unsigned i = first; i < size; i++)
     {
       for (unsigned c = 0; c < 4; c++)
       {
@@ -187,4 +228,6 @@ void LibRaw::scale_colors_loop(float scale_mul[4])
       }
     }
   }
+  };
+  parallel_for(bands, pixels);
 }

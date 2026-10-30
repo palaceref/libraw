@@ -17,6 +17,11 @@ it under the terms of the one of two licenses as you choose:
 
 */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): set_parallel_runner and its runner members, the threads LibRaw's parallel loops run on;
+   2026-10-24: set_xtrans_finish and its members, the caller's code for xtrans_interpolate's last steps;
+   set_pixel_loops and its members, the caller's code for copy_bayer's, scale_colors_loop's and convert_to_rgb_loop's pixels.
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #ifndef _LIBRAW_CLASS_H
 #define _LIBRAW_CLASS_H
 
@@ -208,6 +213,48 @@ public:
 #endif
   int open_buffer(const void *buffer, size_t size);
   virtual int open_datastream(LibRaw_abstract_datastream *);
+  /* PalaceRef: the threads LibRaw's parallel loops run on, where upstream's
+     OpenMP builds would run them (vendor/libraw/SOURCE.md); without a runner
+     they run in order. The runner calls task(context, index, worker) for
+     every index below count, each worker (below `workers`) one task at a
+     time, and returns once all have, rethrowing the first exception a task
+     threw. */
+  typedef void (*parallel_task_t)(void *context, int index, int worker);
+  typedef void (*parallel_runner_t)(void *opaque, int count, parallel_task_t task, void *context);
+  void set_parallel_runner(parallel_runner_t runner, void *opaque, int workers)
+  {
+    parallel_runner = runner;
+    parallel_opaque = opaque;
+    parallel_workers = runner && workers > 1 ? workers : 1;
+  }
+  /* PalaceRef: xtrans_interpolate's steps from CIELab on for each tile (each
+     direction's derivatives, the homogeneity maps, the averaged pixels
+     written into image), by the caller's code where it gives some:
+     finish(opaque, buffer, top, left, mrow, mcol, ndir), buffer the tile's
+     (its ndir directions' RGB first, then the room the steps use), mrow and
+     mcol the tile's limits as the loop computes them. */
+  typedef void (*xtrans_finish_t)(void *opaque, char *buffer, int top, int left, int mrow, int mcol, int ndir);
+  void set_xtrans_finish(xtrans_finish_t finish, void *opaque)
+  {
+    xtrans_finish = finish;
+    xtrans_finish_opaque = opaque;
+  }
+  /* PalaceRef: copy_bayer's, scale_colors_loop's and convert_to_rgb_loop's
+     pixels by the caller's code where it gives some: each is called with its
+     loop's arguments where the loop begins, and returns nonzero where it has
+     made the loop's results (convert_to_rgb's histogram among them), 0 where
+     it leaves them to LibRaw's own loop. */
+  struct pixel_loops_t
+  {
+    int (*copy_bayer)(void *opaque, const unsigned short cblack[4], unsigned short *dmaxp);
+    int (*scale_colors)(void *opaque, const float scale_mul[4]);
+    int (*convert_to_rgb)(void *opaque, const float out_cam[3][4]);
+  };
+  void set_pixel_loops(const pixel_loops_t &loops, void *opaque)
+  {
+    pixel_loops = loops;
+    pixel_loops_opaque = opaque;
+  }
   virtual int open_bayer(const unsigned char *data, unsigned datalen,
                          ushort _raw_width, ushort _raw_height,
                          ushort _left_margin, ushort _top_margin,
@@ -494,6 +541,17 @@ protected:
   
   /* Fast cancel flag */
   long _exitflag;
+
+  /* PalaceRef: set_parallel_runner's runner. */
+  parallel_runner_t parallel_runner = 0;
+  void *parallel_opaque = 0;
+  int parallel_workers = 1;
+  /* PalaceRef: set_xtrans_finish's. */
+  xtrans_finish_t xtrans_finish = 0;
+  void *xtrans_finish_opaque = 0;
+  /* PalaceRef: set_pixel_loops's. */
+  pixel_loops_t pixel_loops = {};
+  void *pixel_loops_opaque = 0;
 
   /* DNG SDK data */
   void *dnghost;

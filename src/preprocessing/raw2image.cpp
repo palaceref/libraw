@@ -13,6 +13,10 @@
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): copy_bayer's rows on the parallel runner;
+   2026-10-24: copy_bayer by the caller's code where it gives some (set_pixel_loops).
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #include "../../internal/libraw_cxx_defs.h"
 
 void LibRaw::raw2image_start()
@@ -272,15 +276,23 @@ void LibRaw::copy_fuji_uncropped(unsigned short cblack[4],
 
 void LibRaw::copy_bayer(unsigned short cblack[4], unsigned short *dmaxp)
 {
+  /* PalaceRef: the caller's loop where it gives one and takes this mosaic. */
+  if (pixel_loops.copy_bayer && pixel_loops.copy_bayer(pixel_loops_opaque, cblack, dmaxp))
+    return;
   // Both cropped and uncropped
   int maxHeight = MIN(int(S.height),int(S.raw_height)-int(S.top_margin));
-#if defined(LIBRAW_USE_OPENMP)
-#pragma omp parallel for schedule(dynamic) default(none) shared(dmaxp) firstprivate(cblack, maxHeight)
-#endif
-  for (int row = 0; row < maxHeight ; row++)
+  /* PalaceRef: bands of rows on the parallel runner, each worker's maximum
+     kept apart, then the largest. */
+  unsigned short *maxima = (unsigned short *)calloc(parallel_workers, sizeof(unsigned short));
+  if (!maxima)
+    throw LIBRAW_EXCEPTION_ALLOC;
+  const int band = 64, bands = (maxHeight + band - 1) / band;
+  auto rows = [&](int index, int worker)
+  {
+  for (int row = index * band; row < MIN(maxHeight, (index + 1) * band); row++)
   {
     int col;
-    unsigned short ldmax = 0;
+    unsigned short &ldmax = maxima[worker];
     for (col = 0; col < S.width && col + S.left_margin < S.raw_width; col++)
     {
       unsigned short val =
@@ -297,14 +309,21 @@ void LibRaw::copy_bayer(unsigned short cblack[4], unsigned short *dmaxp)
         val = 0;
       imgdata.image[((row) >> IO.shrink) * S.iwidth + ((col) >> IO.shrink)][cc] = val;
     }
-#if defined(LIBRAW_USE_OPENMP)
-#pragma omp critical(dataupdate)
-#endif
-    {
-      if (*dmaxp < ldmax)
-        *dmaxp = ldmax;
-    }
   }
+  };
+  try
+  {
+    parallel_for(bands, rows);
+  }
+  catch (...)
+  {
+    free(maxima);
+    throw;
+  }
+  for (int w = 0; w < parallel_workers; w++)
+    if (*dmaxp < maxima[w])
+      *dmaxp = maxima[w];
+  free(maxima);
 }
 
 int LibRaw::raw2image_ex(int do_subtract_black)

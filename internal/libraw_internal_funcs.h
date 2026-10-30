@@ -14,12 +14,29 @@ it under the terms of the one of two licenses as you choose:
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): parallel_for, which runs a loop on set_parallel_runner's threads.
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #ifndef _LIBRAW_INTERNAL_FUNCS_H
 #define _LIBRAW_INTERNAL_FUNCS_H
 
 #ifndef LIBRAW_LIBRARY_BUILD
 #error "This file should be used only for libraw library build"
 #else
+
+/* PalaceRef: f(index, worker) for every index below count, on the runner's
+   threads (set_parallel_runner), or in order without one. */
+	template <class F> void parallel_for(int count, F &f)
+	{
+		if (parallel_workers < 2 || count < 2)
+		{
+			for (int i = 0; i < count; i++)
+				f(i, 0);
+			return;
+		}
+		parallel_runner(parallel_opaque, count,
+		                [](void *context, int index, int worker) { (*static_cast<F *>(context))(index, worker); }, &f);
+	}
 
 /* inline functions */
 	static int stread(char *buf, size_t len, LibRaw_abstract_datastream *fp);
@@ -169,6 +186,8 @@ it under the terms of the one of two licenses as you choose:
 // Adobe DNG
 	void        adobe_copy_pixel (unsigned int row, unsigned int col, ushort **rp);
 	void        lossless_dng_load_raw();
+	/* PalaceRef: lossless_dng_load_raw's plain tiles side by side; 0 where it leaves them to LibRaw's loop. */
+	int         palace_lossless_dng();
 	void        deflate_dng_load_raw();
 	void        packed_dng_load_raw();
     void        packed_tiled_dng_load_raw();

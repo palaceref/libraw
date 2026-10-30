@@ -16,6 +16,9 @@
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): ahd_interpolate's rows of tiles on the parallel runner.
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #include "../../internal/dcraw_defs.h"
 
 /*
@@ -292,27 +295,23 @@ void LibRaw::ahd_interpolate_combine_homogeneous_pixels(
 }
 void LibRaw::ahd_interpolate()
 {
-    int terminate_flag = 0;
+    /* PalaceRef: rows of tiles on the parallel runner, as upstream's OpenMP
+       build runs them; each tile reads only what border_interpolate and the
+       raw samples leave, so their order does not change a pixel. */
+    volatile int terminate_flag = 0;
     cielab(0, 0);
     border_interpolate(5);
 
-#ifdef LIBRAW_USE_OPENMP
-    int buffer_count = omp_get_max_threads();
-#else
-    int buffer_count = 1;
-#endif
+    int buffer_count = parallel_workers;
 
     size_t buffer_size = 26 * LIBRAW_AHD_TILE * LIBRAW_AHD_TILE; /* 1664 kB */
     char** buffers = malloc_omp_buffers(buffer_count, buffer_size);
 
-#ifdef LIBRAW_USE_OPENMP
-#pragma omp parallel for schedule(dynamic) default(none) shared(terminate_flag) firstprivate(buffers)
-#endif
-    for (int top = 2; top < height - 5; top += LIBRAW_AHD_TILE - 6)
+    const int tile_rows = (height - 5 - 2 + LIBRAW_AHD_TILE - 7) / (LIBRAW_AHD_TILE - 6);
+    auto tile_row = [&](int index, int worker)
     {
-#ifdef LIBRAW_USE_OPENMP
-        if (0 == omp_get_thread_num())
-#endif
+        int top = 2 + index * (LIBRAW_AHD_TILE - 6);
+        if (worker == 0)
             if (callbacks.progress_cb)
             {
                 int rr = (*callbacks.progress_cb)(callbacks.progresscb_data,
@@ -322,11 +321,7 @@ void LibRaw::ahd_interpolate()
                     terminate_flag = 1;
             }
 
-#if defined(LIBRAW_USE_OPENMP)
-        char* buffer = buffers[omp_get_thread_num()];
-#else
-        char* buffer = buffers[0];
-#endif
+        char* buffer = buffers[worker];
 
         ushort(*rgb)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE][3];
         short(*lab)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE][3];
@@ -346,6 +341,15 @@ void LibRaw::ahd_interpolate()
             ahd_interpolate_build_homogeneity_map(top, left, lab, homo);
             ahd_interpolate_combine_homogeneous_pixels(top, left, rgb, homo);
         }
+    };
+    try
+    {
+        parallel_for(tile_rows, tile_row);
+    }
+    catch (...)
+    {
+        free_omp_buffers(buffers, buffer_count);
+        throw;
     }
 
     free_omp_buffers(buffers, buffer_count);

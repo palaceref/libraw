@@ -16,6 +16,9 @@ it under the terms of the one of two licenses as you choose:
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): fuji_decode_loop's strips on the parallel runner.
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #include "../../internal/libraw_cxx_defs.h"
 
 #ifdef _abs
@@ -1157,6 +1160,7 @@ void LibRaw::fuji_decode_loop(fuji_compressed_params *common_info, int count, IN
   unsigned errcnt = 0;
 #pragma omp parallel for private(cur_block) shared(errcnt)
 #endif
+#ifdef LIBRAW_USE_OPENMP
   for (cur_block = 0; cur_block < count; cur_block++)
   {
     try
@@ -1166,14 +1170,21 @@ void LibRaw::fuji_decode_loop(fuji_compressed_params *common_info, int count, IN
     }
     catch (...)
     {
-#ifdef LIBRAW_USE_OPENMP
 #pragma omp atomic
 		  errcnt++;
-#else
-		  throw;
-#endif
 	  }
   }
+#else
+  /* PalaceRef: strips on the parallel runner, as upstream's OpenMP build runs
+     them; their reads lock the stream (fuji_fill_buffer). */
+  (void)cur_block;
+  auto strip = [&](int block, int)
+  {
+    fuji_decode_strip(common_info, block, raw_block_offsets[block], block_sizes[block],
+                      q_bases ? q_bases + block * lineStep : 0);
+  };
+  parallel_for(count, strip);
+#endif
 #ifdef LIBRAW_USE_OPENMP
   if (errcnt)
 		  throw LIBRAW_EXCEPTION_IO_EOF;

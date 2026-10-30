@@ -16,7 +16,13 @@
 
  */
 
+/* Modified by PalaceRef, 2026-10-23 (CDDL 1.0 section 3.3): xtrans_interpolate's tiles on the parallel runner, in a wavefront that keeps the serial result;
+   2026-10-24: each tile's steps from CIELab on by the caller's code where it gives some (set_xtrans_finish).
+   The changes are marked "PalaceRef"; vendor/libraw/SOURCE.md lists them. */
+
 #include "../../internal/dcraw_defs.h"
+#include <atomic>
+#include <memory>
 
 #define fcol(row, col) xtrans[(row + 6) % 6][(col + 6) % 6]
 /*
@@ -165,25 +171,29 @@ void LibRaw::xtrans_interpolate(int passes)
 		  }
 	  }
 
-#if defined(LIBRAW_USE_OPENMP)
-  int buffer_count = omp_get_max_threads();
-#else
-  int buffer_count = 1;
-#endif
+  /* PalaceRef: tiles on the parallel runner in a wavefront. A tile reads the
+     image as the tiles before it in row order left it (its left and upper
+     borders hold their final pixels), so a tile starts once the tile to its
+     left and the row above up to the tile right of it are done: exactly the
+     serial order's input, whatever the threads (upstream's OpenMP build runs
+     rows of tiles at once, which is not). */
+  int buffer_count = parallel_workers;
 
   size_t buffer_size = LIBRAW_AHD_TILE * LIBRAW_AHD_TILE * (ndir * 11 + 6);
   char** buffers = malloc_omp_buffers(buffer_count, buffer_size);
 
-#if defined(LIBRAW_USE_OPENMP)
-# pragma omp parallel for schedule(dynamic) default(none) firstprivate(buffers, allhex, passes, sgrow, sgcol, ndir) shared(dir) 
-#endif
-    for (int top = 3; top < height - 19; top += LIBRAW_AHD_TILE - 16)
+  const int tile_rows = height - 19 > 3 ? (height - 19 - 3 + LIBRAW_AHD_TILE - 17) / (LIBRAW_AHD_TILE - 16) : 0;
+  const int tile_columns = width - 19 > 3 ? (width - 19 - 3 + LIBRAW_AHD_TILE - 17) / (LIBRAW_AHD_TILE - 16) : 0;
+  std::unique_ptr<std::atomic<int>[]> done(new std::atomic<int>[tile_rows > 0 ? tile_rows : 1]);
+  for (int r = 0; r < tile_rows; r++)
+    done[r] = 0;
+  std::atomic<bool> failed(false);
+  auto tile_row = [&](int index, int worker)
+  {
+    int top = 3 + index * (LIBRAW_AHD_TILE - 16);
+    try
     {
-#if defined(LIBRAW_USE_OPENMP)
-        char* buffer = buffers[omp_get_thread_num()];
-#else
-        char* buffer = buffers[0];
-#endif
+        char* buffer = buffers[worker];
 
         ushort(*rgb)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE][3], (*rix)[3];
         short(*lab)[LIBRAW_AHD_TILE][3], (*lix)[3];
@@ -198,8 +208,19 @@ void LibRaw::xtrans_interpolate(int passes)
         homo = (char(*)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE])(
             buffer + LIBRAW_AHD_TILE * LIBRAW_AHD_TILE * (ndir * 10 + 6));
 
-        for (int left = 3; left < width - 19; left += LIBRAW_AHD_TILE - 16)
+        for (int left = 3, column = 0; left < width - 19; left += LIBRAW_AHD_TILE - 16, column++)
         {
+            if (index > 0)
+            {
+                const int need = MIN(column + 2, tile_columns);
+                for (int seen; (seen = done[index - 1].load(std::memory_order_acquire)) < need;)
+                {
+                    if (failed.load())
+                        return;
+                    done[index - 1].wait(seen, std::memory_order_acquire);
+                }
+            }
+            rgb = (ushort(*)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE][3])buffer;
             int mrow = MIN(top + LIBRAW_AHD_TILE, height - 3);
             int mcol = MIN(left + LIBRAW_AHD_TILE, width - 3);
             for (int row = top; row < mrow; row++)
@@ -344,6 +365,11 @@ void LibRaw::xtrans_interpolate(int passes)
                             }
             }
             rgb = (ushort(*)[LIBRAW_AHD_TILE][LIBRAW_AHD_TILE][3])buffer;
+            /* PalaceRef: the steps from here on by the caller's code, where it gives some (set_xtrans_finish). */
+            if (xtrans_finish)
+                xtrans_finish(xtrans_finish_opaque, buffer, top, left, mrow, mcol, ndir);
+            else
+            {
             mrow -= top;
             mcol -= left;
 
@@ -422,12 +448,29 @@ void LibRaw::xtrans_interpolate(int passes)
                         }
                     FORC3 image[(row + top) * width + col + left][c] = avg[c] / avg[3];
                 }
+            }
+            done[index].store(column + 1, std::memory_order_release);
+            done[index].notify_all();
         }
     }
-  
-#ifdef LIBRAW_USE_OPENMP
-#pragma omp barrier
-#endif
+    catch (...)
+    {
+        /* The rows below wait for this one: they stop instead. */
+        failed = true;
+        done[index].store(tile_columns, std::memory_order_release);
+        done[index].notify_all();
+        throw;
+    }
+  };
+  try
+  {
+    parallel_for(tile_rows, tile_row);
+  }
+  catch (...)
+  {
+    free_omp_buffers(buffers, buffer_count);
+    throw;
+  }
 
     free_omp_buffers(buffers, buffer_count);
 
